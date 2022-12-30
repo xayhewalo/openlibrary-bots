@@ -14,4 +14,4 @@ fi
 OL_DUMP=$1
 OUTPUT=$2
 
-zgrep ^/type/edition $OL_DUMP | grep -v '"languages": \[{"key": "/languages' | grep '"language' | pv | gzip > $OUTPUT
+pv "$OL_DUMP" | zgrep ^/type/edition | grep -v '"languages": \[{"key": "/languages' | grep '"language' | gzip > "$OUTPUT"
