@@ -1,84 +1,104 @@
 """Reformat language keys in Editions"""
-
-import copy
 import gzip
 import requests
 
+from enum import Enum, auto, unique
 from olclient.bots import AbstractBotJob
 
 
+@unique
+class FailureMode(Enum):
+    FIELD_NAME = auto()  # the field name is wrong
+    STRING = auto()  # key value is a string not a list of dicts
+    LANGUAGE_CODE = auto()  # invalid language code
+
+
 class LanguageBot(AbstractBotJob):
-    def __init__(self):
+    def __init__(self, *args, **kwargs):
         self.VALID_ATTR_NAME = 'languages'
         self.INVALID_ATTR_NAME = 'language'
-        self.VALID_LANGUAGE_DICTS = tuple(requests.get('https://openlibrary.org/query.json?type=/type/language&key=&limit=10000').json())
+        valid_language_code_url = "https://openlibrary.org/query.json?type=/type/language&key=&limit=10000"
+        self.VALID_LANGUAGE_DICTS = tuple(requests.get(valid_language_code_url).json())
         self.VALID_LANGUAGE_CODES = list()
         for _lang_dicts in self.VALID_LANGUAGE_DICTS:
             self.VALID_LANGUAGE_CODES.append(_lang_dicts['key'].split('/')[-1])
         self.VALID_LANGUAGE_CODES = tuple(self.VALID_LANGUAGE_CODES)
-        super(LanguageBot, self).__init__()
+        super(LanguageBot, self).__init__(*args, **kwargs)
 
-    def fix_languages(self, _attr_name: str, _languages) -> list:
+    def fix_languages(self, failure_modes: list, languages: dict) -> list:
         """
-        Attempts to mends the language attribute of an Open Library Edition. Does nothing for non-trivial failure modes.
-        :param _languages: dictionary containing the language attribute(s) of an Open Library Edition
+        Attempts to mend the language attribute of an Open Library Edition. Does nothing for non-trivial failure modes.
+        :param languages: dictionary containing the language attribute(s) of an Open Library Edition
+        :param failure_modes: how the languages parameter is faulty
         """
-        failure_mode = self.get_failure_mode(_attr_name, _languages)
-        if failure_mode == 'invalid_attr_name':
-            return _languages
-        elif failure_mode == 'string':
-            if _languages in self.VALID_LANGUAGE_CODES:
-                return [{'key': '/%s/%s' % (self.VALID_ATTR_NAME, _languages)}]
-        return _languages
+        key_name = self.INVALID_ATTR_NAME if FailureMode.FIELD_NAME in failure_modes else self.VALID_ATTR_NAME
+        old_language_value = languages[key_name]
+        fixed_languages = []
 
-    def get_failure_mode(self, attr_name: str, language_attr) -> str:
+        if FailureMode.STRING in failure_modes:
+            fixed_languages = [old_language_value]
+            for language_code in languages.values():
+                if language_code in self.VALID_LANGUAGE_CODES:
+                    fixed_languages.append({"key": f"/{self.VALID_ATTR_NAME}/{language_code}"})
+
+        if FailureMode.LANGUAGE_CODE in failure_modes:
+            fixed_languages = old_language_value
+            [fixed_languages.append(language_dict) for language_dict in languages.values()]
+        return fixed_languages or old_language_value
+
+    def get_failure_modes(self, languages: dict) -> list:
         """
-        Return human-readable failure mode. Returns 'valid' if the language attribute is well-formed
-        :param attr_name: the name of the attribute on the Open Library Edition
-        :param language_attr: The value of edition.languages where `edition` is an Open Library Edition
+        Return human-readable failure mode(s).
+        :param languages: The result of self.get_languages
         """
-        if attr_name != self.VALID_ATTR_NAME:
-            return 'invalid_attr_name'
-        if isinstance(language_attr, str):
-            # i.e '"languages": "eng"'
-            return 'string'
-        if isinstance(language_attr, list):
-            all_valid = True
-            for lang in language_attr:
-                if lang not in self.VALID_LANGUAGE_DICTS:
-                    # i.e '"languages": [{"key": "/languages/foobar"}]'
-                    all_valid = False
-                    break
-            if all_valid:
-                return 'valid'
-            return'invalid-lang-dict'
-        return 'unknown'
+        failure_modes = []
+        found_string = False
+        all_valid = True
+        found_attr_name = False
+        for attr_name, language in languages.items():
+            if not found_attr_name and attr_name != self.VALID_ATTR_NAME:
+                failure_modes.append(FailureMode.FIELD_NAME)
+                found_attr_name = True
+
+            if not found_string and isinstance(language, str):
+                failure_modes.append(FailureMode.STRING)
+                found_string = True
+
+            if isinstance(language, list):
+                language_list = language
+                for lang in language_list:
+                    if lang not in self.VALID_LANGUAGE_DICTS:
+                        # i.e  "/languages/foobar"'
+                        failure_modes.append(FailureMode.LANGUAGE_CODE)
+                        all_valid = False
+                    if not all_valid:
+                        break
+        return failure_modes
 
     def get_languages(self, obj) -> dict:
         """
         Returns dict with values equal to the language attribute of an Open Library Edition.
-        The dictionary key describes if the attribute name is correct.
+        The dictionary key is the name of the attribute the language value was found on the Edition.
         :param obj: A JSON dictionary or Open Library Edition
         """
         if isinstance(obj, dict):
-            _language = {self.VALID_ATTR_NAME: obj.get(self.VALID_ATTR_NAME),
+            lang_dict = {self.VALID_ATTR_NAME: obj.get(self.VALID_ATTR_NAME),
                          self.INVALID_ATTR_NAME: obj.get(self.INVALID_ATTR_NAME)}
         else:
-            _language = {self.VALID_ATTR_NAME: getattr(obj, self.VALID_ATTR_NAME, None),
+            lang_dict = {self.VALID_ATTR_NAME: getattr(obj, self.VALID_ATTR_NAME, None),
                          self.INVALID_ATTR_NAME: getattr(obj, self.INVALID_ATTR_NAME, None)}
-        if _language.get(self.VALID_ATTR_NAME) is not None and _language.get(self.INVALID_ATTR_NAME) is not None:  # In theory an Open Library edition can have a `language` and a `languages` field.
-            _language.pop(self.INVALID_ATTR_NAME)
-        _language = {k: v for k, v in _language.items() if v is not None}  # don't bother storing non-existent attributes
-        return _language
+        lang_dict = {k: v for k, v in lang_dict.items() if v is not None}  # don't store non-existent attributes
+        return lang_dict
 
     def are_languages_valid(self, languages: dict) -> bool:
         """
         :param languages: dict containing language attribute data of an OpenLibrary Edition
         :returns bool:
         """
-        if [True for attr_name, language in languages.items() if self.get_failure_mode(attr_name, language) == 'valid']:
-            return True
-        return False
+        if self.get_failure_modes(languages):
+            # if any failure modes are found than the 'languages' argument is not valid
+            return False
+        return True
 
     def run(self) -> None:
         """
@@ -88,35 +108,30 @@ class LanguageBot(AbstractBotJob):
         comment = 'reformat language attribute'
         with gzip.open(self.args.file, 'rb') as fin:
             for row_num, row in enumerate(fin):
-                if row_num <= 0: continue
-                print(row_num)
                 row, json_data = self.process_row(row)
-                languages = self.get_languages(json_data)
-                if not languages: continue
-                if self.are_languages_valid(languages): continue
+                old_languages = self.get_languages(json_data)
+                if not old_languages or self.are_languages_valid(old_languages):
+                    continue
 
                 olid = json_data['key'].split('/')[-1]
                 edition = self.ol.Edition.get(olid)
-                languages = self.get_languages(edition)
-                if not languages: continue
-                if self.are_languages_valid(languages): continue
+                old_languages = self.get_languages(edition)
+                if not old_languages or self.are_languages_valid(old_languages):
+                    continue
 
-                # TODO is this the best way to go about fixing the attributes?
-                old_attr_name = list(languages.keys())[0]
-                old_lang_value = copy.deepcopy(getattr(edition, old_attr_name))
-                fixed_langs = list(languages.values())[0]
-                failure_mode = self.get_failure_mode(old_lang_value, fixed_langs)
-                if failure_mode == 'string':
-                    if fixed_langs in self.VALID_LANGUAGE_CODES:
-                        fixed_langs = [{'key': '/%s/%s' % (self.VALID_ATTR_NAME, fixed_langs)}]
-                if old_attr_name != self.VALID_ATTR_NAME or fixed_langs != old_lang_value:
-                    setattr(edition, self.VALID_ATTR_NAME, fixed_langs)
-                    self.logger.info('\t'.join([olid, '"%s": ' % old_attr_name + str(old_lang_value),
-                                                '"%s": ' % self.VALID_ATTR_NAME + str(edition.languages)]))
+                invalid_attr_name, valid_attr_name = self.INVALID_ATTR_NAME, self.VALID_ATTR_NAME
+                failure_modes = self.get_failure_modes(old_languages)
+                if not failure_modes:
+                    continue
+
+                setattr(edition, self.VALID_ATTR_NAME, self.fix_languages(failure_modes, old_languages))
+                if old_languages != edition.languages or FailureMode.FIELD_NAME in failure_modes:
+                    msg = f"{edition.olid}\t'{old_languages}\t'{valid_attr_name}:' {edition.languages}"
+                    self.logger.info(msg)
                     self.save(lambda: edition.save(comment=comment))
 
 
-if '__main__' == __name__:
+if __name__ == "__main__":
     bot = LanguageBot()
 
     try:
